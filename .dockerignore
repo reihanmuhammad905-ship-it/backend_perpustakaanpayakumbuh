@@ -6,3 +6,15 @@ npm-debug.log
 *.md
 uploads/*
 !uploads/.gitkeep
+
+# Rahasia dan file lokal
+.env
+.env.*
+*.env
+*.dump
+*.tar
+*.tar.gz
+server.js.backup-*
+uploads
+.git
+node_modules

@@ -1,0 +1,42 @@
+services:
+  pulen_backend:
+    image: pulen-backend:v0.1
+    restart: unless-stopped
+
+    env_file:
+      - ./.env
+
+    volumes:
+      - ./uploads:/app/uploads
+
+    expose:
+      - "3000"
+
+    networks:
+      - pulen_network
+
+  pulen_admin:
+    image: pulen-admin:v0.1
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:8082:80"
+
+    depends_on:
+      - pulen_backend
+
+    networks:
+      - pulen_network
+
+networks:
+  pulen_network:
+    driver: bridge
+# ==========================================
+# VOLUME POSTGRESQL 16
+# ==========================================
+volumes:
+  postgres_data:
+
+# ==========================================
+# JARINGAN POSTGRESQL 17
+# ==========================================

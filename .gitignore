@@ -1,2 +1,13 @@
 node_modules/
 .env
+.env
+.env.*
+!.env.example
+node_modules/
+uploads/
+*.tar
+*.tar.gz
+*.dump
+*.backup
+*.pem
+*.key

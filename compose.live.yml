@@ -1,0 +1,36 @@
+name: pulen-live
+
+services:
+  pulen_backend:
+    image: pulen-backend:v0.1
+    restart: unless-stopped
+    env_file:
+      - .env.live
+    volumes:
+      # Pastikan app di dalam image menggunakan /app/uploads (cek WORKDIR image)
+      - ./uploads:/app/uploads
+    networks:
+      - pulen_network
+
+  pulen_admin:
+    image: pulen-admin:v0.1
+    restart: unless-stopped
+    depends_on:
+      - pulen_backend
+    ports:
+      # Hanya dapat diakses Nginx host pada SERVER YANG SAMA
+      - '127.0.0.1:8082:80'
+    volumes:
+      # Override konfigurasi Nginx image tanpa rebuild image yang sudah teruji
+      - ./nginx.pulen.prod.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - pulen_network
+
+networks:
+  pulen_network:
+    driver: bridge
+    ipam:
+      config:
+        # WAJIB verifikasi subnet ini tidak bentrok dengan LAN/VPN/jaringan Docker server
+        # PostgreSQL kantor 172.20.2.106 harus diakses lewat jaringan kantor
+        - subnet: 192.168.250.0/24
