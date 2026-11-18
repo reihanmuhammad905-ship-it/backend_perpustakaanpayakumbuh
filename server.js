@@ -6,6 +6,16 @@ const { Pool } = require('pg');
 const app = express();
 app.use(cors());
 app.use(express.json());
+// Batasi file PDF: sampul tetap publik, PDF hanya lewat /api/loans/:id/read-pdf.
+app.use('/uploads', (req, res, next) => {
+  let requestedPath;
+  try { requestedPath = decodeURIComponent(req.path); }
+  catch (_) { return res.status(400).json({status:'error',message:'URL file tidak valid'}); }
+  if (require('path').extname(requestedPath).toLowerCase() === '.pdf') {
+    return res.status(403).json({status:'error',message:'PDF hanya dapat dibaca melalui pinjaman aktif'});
+  }
+  next();
+});
 app.use('/uploads', express.static('uploads'));
 
 const pool = new Pool({
@@ -32,20 +42,33 @@ function generateOtpCode() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
-async function generateMemberId() {
-  const year = new Date().getFullYear();
-  const result = await pool.query(
-    `SELECT member_id FROM users WHERE member_id LIKE $1 ORDER BY member_id DESC LIMIT 1`,
-    [`PMB-${year}%`]
+
+async function generateMemberId(db = pool) {
+  const year = Number(
+    new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Asia/Jakarta',
+      year: 'numeric',
+    }).format(new Date())
   );
-  let nextNumber = 1;
-  if (result.rows.length > 0) {
-    const last = result.rows[0].member_id;
-    const lastNumber = parseInt(last.slice(-4), 10);
-    nextNumber = lastNumber + 1;
-  }
-  return `PMB-${year}${nextNumber.toString().padStart(4, '0')}`;
+
+  const result = await db.query(
+    `
+    INSERT INTO public.pulen_member_number_counters
+      (year, last_number)
+    VALUES ($1, 1)
+    ON CONFLICT (year)
+    DO UPDATE SET last_number =
+      public.pulen_member_number_counters.last_number + 1
+    RETURNING last_number
+    `,
+    [year]
+  );
+
+  const number = result.rows[0].last_number;
+
+  return `PMB-${year}${String(number).padStart(4, '0')}`;
 }
+
 
 async function createNotification(userId, type, title, message) {
   try {
@@ -130,6 +153,19 @@ app.get('/api/categories', async (req, res) => {
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 
+const createMyKopayRouter = require('./pulen_mykopay_auth');
+
+app.use('/api/auth', createMyKopayRouter({
+  pool,
+  jwt,
+  bcrypt,
+  generateMemberId,
+}));
+
+
+
+
+
 // Cek token login (dipakai untuk endpoint yang perlu tahu siapa yang login)
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
@@ -148,20 +184,52 @@ function authenticateToken(req, res, next) {
   });
 }
 
+
+// PULEN Firebase pilot: hanya aktif jika PULEN_FIREBASE_PILOT_ENABLED=true.
+const createPulenFirebaseRouter = require('./pulen_firebase_auth');
+app.use('/api/auth/firebase', createPulenFirebaseRouter({ pool, jwt }));
+
+// PDF hanya dari ID pinjaman dan JWT PULEN; bukan URL file publik.
+const createPulenProtectedPdfRouter = require('./pulen_protected_pdf');
+app.use('/api/loans', createPulenProtectedPdfRouter({ pool, authenticateToken }));
+// Pengembalian oleh anggota PULEN dan API riwayat baca (isolasi dari login/admin).
+const createPulenLoanLifecycleRouter = require('./pulen_loan_lifecycle');
+app.use('/api/loans', createPulenLoanLifecycleRouter({ pool, authenticateToken }));
+const createPulenMemberProfileRouter = require('./pulen_member_profile');
+app.use('/api/pulen/profile', createPulenMemberProfileRouter({ pool, authenticateToken }));
+
 // Proses otomatis: pinjaman yang lewat jatuh tempo & belum dikembalikan
 // jadi 'berakhir_otomatis', stoknya dikembalikan satu.
+// PULEN stock transition safety V1 (admin, legacy member, expired loans)
+const { closeLoan: closePulenLoanSafely } = require('./pulen_stock_transitions');
+
+// Expire one loan at a time through the same atomic transition used by admin.
+// If a return wins the race, the expired transition is a no-op and stock is not duplicated.
 async function processExpiredLoans() {
-  const expired = await pool.query(`
-    UPDATE loans SET status = 'berakhir_otomatis', tanggal_dikembalikan = CURRENT_TIMESTAMP
-    WHERE status = 'aktif' AND tanggal_kembali < NOW()
-    RETURNING book_id, user_id, id
-  `);
-  for (const row of expired.rows) {
-    await pool.query('UPDATE books SET stok = stok + 1 WHERE id = $1', [row.book_id]);
-    await createNotification(
-      row.user_id, 'overdue', 'Peminjaman Berakhir Otomatis',
-      'Peminjaman Anda telah melewati batas waktu dan berakhir otomatis.'
-    );
+  try {
+    const expired = await pool.query(`SELECT id FROM public.loans
+      WHERE status='aktif' AND tanggal_kembali < NOW()
+      ORDER BY tanggal_kembali ASC, id ASC LIMIT 100`);
+    for (const row of expired.rows) {
+      try {
+        const result = await closePulenLoanSafely({
+          pool, loanId: row.id, newStatus: 'berakhir_otomatis', requireExpired: true
+        });
+        if (!result.changed) continue;
+        try {
+          await createNotification(
+            result.loan.user_id, 'overdue', 'Peminjaman Berakhir Otomatis',
+            'Peminjaman Anda telah melewati batas waktu dan berakhir otomatis.'
+          );
+        } catch (noticeError) {
+          console.error('[PULEN AUTO-EXPIRE] notification', noticeError.code || 'error');
+        }
+      } catch (loanError) {
+        console.error('[PULEN AUTO-EXPIRE] loan', row.id, loanError.code || 'error');
+      }
+    }
+  } catch (error) {
+    console.error('[PULEN AUTO-EXPIRE] list', error.code || 'error');
   }
 }
 
@@ -340,7 +408,7 @@ function requireAdmin(req, res, next) {
 }
 
 // ADMIN REGISTER
-app.post('/api/admin/register', async (req, res) => {
+app.post('/api/admin/register', authenticateToken, requireAdmin, async (req, res) => {
   const { name, email, password } = req.body;
 
   if (!name || !email || !password) {
@@ -417,6 +485,15 @@ app.post('/api/admin/login', async (req, res) => {
 });
 
 // PINJAM BUKU
+// PULEN queue pilot integration (isolated; does not change MyKopay login)
+const createPulenQueueNotifications = require('./pulen_queue_notifications');
+const pulenQueueNotifications = createPulenQueueNotifications({pool, authenticateToken});
+app.use('/api/pulen', pulenQueueNotifications.router);
+app.use('/api/loans/confirm-otp', pulenQueueNotifications.confirmOtpRouter);
+app.use('/api/queue', pulenQueueNotifications.queueMutationsRouter);
+app.use(pulenQueueNotifications.guardBorrow);
+pulenQueueNotifications.startWorker();
+
 app.post('/api/loans', authenticateToken, async (req, res) => {
   const { book_id } = req.body;
   const user_id = req.user.id;
@@ -537,41 +614,20 @@ app.get('/api/loans/my', authenticateToken, async (req, res) => {
   }
 });
 
-// KEMBALIKAN BUKU
+// KEMBALIKAN BUKU — kompatibilitas pengguna legacy.
+// Firebase PULEN users already use the earlier, scoped lifecycle router.
 app.post('/api/loans/:id/return', authenticateToken, async (req, res) => {
-  const loanId = req.params.id;
   try {
-    const loanResult = await pool.query(
-      "SELECT * FROM loans WHERE id = $1 AND user_id = $2 AND status = 'aktif'",
-      [loanId, req.user.id]
-    );
-    if (loanResult.rows.length === 0) {
-      return res.status(404).json({ status: 'error', message: 'Data peminjaman tidak ditemukan' });
-    }
-
-    const bookId = loanResult.rows[0].book_id;
-
-    await pool.query(
-      "UPDATE loans SET status = 'dikembalikan', tanggal_dikembalikan = CURRENT_TIMESTAMP WHERE id = $1",
-      [loanId]
-    );
-    await pool.query('UPDATE books SET stok = stok + 1 WHERE id = $1', [bookId]);
-
-    const nextInQueue = await pool.query(
-      `SELECT q.user_id, b.judul FROM queue q JOIN books b ON q.book_id = b.id
-       WHERE q.book_id = $1 AND q.status = 'menunggu' ORDER BY q.posisi ASC LIMIT 1`,
-      [bookId]
-    );
-    if (nextInQueue.rows.length > 0) {
-      await createNotification(
-        nextInQueue.rows[0].user_id, 'available', 'Buku Tersedia',
-        `Buku "${nextInQueue.rows[0].judul}" yang Anda tunggu sekarang tersedia.`
-      );
-    }
-
-    res.json({ status: 'success' });
-  } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message });
+    const result = await closePulenLoanSafely({
+      pool, loanId: req.params.id, userId: req.user.id
+    });
+    if (!result.changed) return res.status(result.reason === 'invalid' ? 400 : 404).json({
+      status: 'error', message: 'Peminjaman tidak ditemukan atau tidak aktif'
+    });
+    return res.json({status:'success', message:'Buku berhasil dikembalikan'});
+  } catch (error) {
+    console.error('[PULEN LEGACY RETURN]', error.code || 'error');
+    return res.status(500).json({status:'error', message:'Pengembalian belum berhasil. Silakan coba lagi.'});
   }
 });
 
@@ -1109,33 +1165,14 @@ app.get('/api/admin/loans', authenticateToken, requireAdmin, async (req, res) =>
 // ADMIN: TANDAI DIKEMBALIKAN (bisa untuk siapa saja, tidak terbatas punya sendiri)
 app.post('/api/admin/loans/:id/return', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const loanResult = await pool.query("SELECT * FROM loans WHERE id = $1 AND status = 'aktif'", [req.params.id]);
-    if (loanResult.rows.length === 0) {
-      return res.status(404).json({ status: 'error', message: 'Data peminjaman tidak ditemukan atau sudah selesai' });
-    }
-
-    await pool.query(
-      "UPDATE loans SET status = 'dikembalikan', tanggal_dikembalikan = CURRENT_TIMESTAMP WHERE id = $1",
-      [req.params.id]
-    );
-    await pool.query('UPDATE books SET stok = stok + 1 WHERE id = $1', [loanResult.rows[0].book_id]);
-
-    const bookId = loanResult.rows[0].book_id;
-    const nextInQueue = await pool.query(
-      `SELECT q.user_id, b.judul FROM queue q JOIN books b ON q.book_id = b.id
-       WHERE q.book_id = $1 AND q.status = 'menunggu' ORDER BY q.posisi ASC LIMIT 1`,
-      [bookId]
-    );
-    if (nextInQueue.rows.length > 0) {
-      await createNotification(
-        nextInQueue.rows[0].user_id, 'available', 'Buku Tersedia',
-        `Buku "${nextInQueue.rows[0].judul}" yang Anda tunggu sekarang tersedia.`
-      );
-    }
-
-    res.json({ status: 'success' });
-  } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message });
+    const result = await closePulenLoanSafely({pool, loanId: req.params.id});
+    if (!result.changed) return res.status(result.reason === 'invalid' ? 400 : 404).json({
+      status: 'error', message: 'Peminjaman tidak ditemukan atau sudah selesai'
+    });
+    return res.json({status:'success', message:'Buku berhasil dikembalikan'});
+  } catch (error) {
+    console.error('[PULEN ADMIN RETURN]', error.code || 'error');
+    return res.status(500).json({status:'error', message:'Pengembalian belum berhasil. Silakan coba lagi.'});
   }
 });
 
